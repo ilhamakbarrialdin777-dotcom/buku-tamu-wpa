@@ -1,0 +1,6 @@
+{
+  "name": "Buku Tamu dan E-Induksi K3",
+  "description": "Sistem Registrasi Tamu Digital dan E-Safety Induction K3 Pertambangan PT. Watu Perkasa Abadi",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
