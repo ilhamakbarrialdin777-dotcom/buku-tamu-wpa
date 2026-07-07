@@ -57,6 +57,8 @@ export default function App() {
   // Real-time toast notification list
   const [notifications, setNotifications] = useState<LiveNotification[]>([]);
   const isInitialLoadRef = useRef<boolean>(true);
+  const viewModeRef = useRef<ViewMode>(viewMode);
+  const activeRegIdRef = useRef<string | null>(null);
 
   const showNotification = (type: LiveNotification['type'], message: string) => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -140,6 +142,10 @@ export default function App() {
   const [submitProgress, setSubmitProgress] = useState<string>('');
   const [activeRegId, setActiveRegId] = useState<string | null>(null);
 
+  // Sync refs during render to avoid dependency-array closure staleness
+  viewModeRef.current = viewMode;
+  activeRegIdRef.current = activeRegId;
+
   // Auto-seed and load server/local database with real-time polling
   useEffect(() => {
     let recordsLoaded = false;
@@ -214,30 +220,52 @@ export default function App() {
 
   // Helper to fetch full records and logs from server (Single Source of Truth synchronization)
   const fetchFullSync = () => {
+    if (!navigator.onLine) return;
+    
     console.log("[SYNC] Memulai sinkronisasi penuh dari server...");
     fetch('/api/records')
       .then(res => res.json())
       .then(data => {
         if (Array.isArray(data)) {
           setRecords(prev => {
-            // Reconcile and preserve local unsynced offline records if they exist
-            const pending = prev.filter(r => r.isPendingSync);
-            const merged = [...data];
+            // Find our active local draft to preserve it
+            const activeId = activeRegIdRef.current;
+            const localDraft = (viewModeRef.current === 'WIZARD' && activeId) 
+              ? prev.find(r => r.id === activeId) 
+              : null;
+
+            // Reconcile pending offline writes (excluding the active draft which is handled separately)
+            const pending = prev.filter(r => r.isPendingSync && r.id !== activeId);
+            
+            // Build the next set of records starting with server data
+            let next = [...data];
+            
+            // Merge pending offline records
             pending.forEach(pend => {
-              const idx = merged.findIndex(m => m.id === pend.id);
+              const idx = next.findIndex(m => m.id === pend.id);
               if (idx !== -1) {
-                // If the local pending one is newer, keep it
-                const serverTime = merged[idx].updatedAt ? new Date(merged[idx].updatedAt).getTime() : 0;
+                const serverTime = next[idx].updatedAt ? new Date(next[idx].updatedAt).getTime() : 0;
                 const localTime = pend.updatedAt ? new Date(pend.updatedAt).getTime() : 0;
                 if (localTime > serverTime) {
-                  merged[idx] = pend;
+                  next[idx] = pend;
                 }
               } else {
-                merged.unshift(pend);
+                next.unshift(pend);
               }
             });
-            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(merged));
-            return merged;
+
+            // Restore/preserve active local draft so typing is never interrupted
+            if (localDraft) {
+              const idx = next.findIndex(r => r.id === activeId);
+              if (idx !== -1) {
+                next[idx] = localDraft;
+              } else {
+                next.unshift(localDraft);
+              }
+            }
+
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+            return next;
           });
         }
       })
@@ -275,7 +303,7 @@ export default function App() {
           
           setRecords(prev => {
             // If we are currently in WIZARD editing this record, do not overwrite to prevent cursor jumps
-            if (viewMode === 'WIZARD' && activeRegId === newRec.id) {
+            if (viewModeRef.current === 'WIZARD' && activeRegIdRef.current === newRec.id) {
               return prev;
             }
 
@@ -413,7 +441,17 @@ export default function App() {
       if (eventSource) eventSource.close();
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
     };
-  }, [isOnline, viewMode, activeRegId]);
+  }, [isOnline]);
+
+  // Periodic background synchronization loop (Single Source of Truth backup)
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      if (isOnline) {
+        fetchFullSync();
+      }
+    }, 4000);
+    return () => clearInterval(syncInterval);
+  }, [isOnline]);
 
   // Offline pending sync algorithm
   const syncPendingRecords = () => {
@@ -542,10 +580,11 @@ export default function App() {
       .then(res => res.json())
       .then(data => {
         if (data.success && data.record) {
-          setRecords(prev => prev.map(r => r.id === payload.id ? { ...data.record, isPendingSync: false } : r));
-          localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(
-            records.map(r => r.id === payload.id ? { ...data.record, isPendingSync: false } : r)
-          ));
+          setRecords(prev => {
+            const next = prev.map(r => r.id === payload.id ? { ...data.record, isPendingSync: false } : r);
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+            return next;
+          });
         }
       })
       .catch(err => {
@@ -661,10 +700,11 @@ export default function App() {
         .then(res => res.json())
         .then(data => {
           if (data.success && data.record) {
-            setRecords(prev => prev.map(r => r.id === currentId ? { ...data.record, isPendingSync: false } : r));
-            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(
-              records.map(r => r.id === currentId ? { ...data.record, isPendingSync: false } : r)
-            ));
+            setRecords(prev => {
+              const next = prev.map(r => r.id === currentId ? { ...data.record, isPendingSync: false } : r);
+              localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+              return next;
+            });
           }
         })
         .catch(err => {
