@@ -199,7 +199,9 @@ async function startServer() {
         // Incoming is newer or it's a draft update, apply and bump version
         updatedRecord.version = Math.max(existingVersion + 1, incomingVersion);
         updatedRecord.updatedAt = new Date().toISOString(); // Let the server assign the unified monotonic timestamp!
-        records[index] = { ...existing, ...updatedRecord };
+        const finalRecord = { ...existing, ...updatedRecord };
+        records[index] = finalRecord;
+        updatedRecord = finalRecord;
       } else {
         // Brand new record
         updatedRecord.version = record.version || 1;

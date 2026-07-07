@@ -369,6 +369,15 @@ export default function App() {
               next = [newRec, ...prev];
             }
             localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+
+            // Sync the recent record state if it was updated on another device (e.g. checkout from dashboard)
+            setRecentRecord(prevRecent => {
+              if (prevRecent && prevRecent.id === newRec.id) {
+                return newRec;
+              }
+              return prevRecent;
+            });
+
             return next;
           });
         } catch (e) {
