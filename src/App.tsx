@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
-  Shield, Users, ClipboardCheck, ArrowLeft, ArrowRight, Check, AlertOctagon, AlertTriangle, BookOpen, Clock, HeartHandshake, PhoneCall, HelpCircle, FileCheck, Send, Compass, RefreshCw
+  Shield, Users, ClipboardCheck, ArrowLeft, ArrowRight, Check, AlertOctagon, AlertTriangle, BookOpen, Clock, HeartHandshake, PhoneCall, HelpCircle, FileCheck, Send, Compass, RefreshCw,
+  Bell, UserPlus, LogOut, Volume2, X
 } from 'lucide-react';
 import { GuestRecord, SecurityLog } from './types';
 import {
@@ -16,6 +17,32 @@ import { SignatureCanvas } from './components/SignatureCanvas';
 import { SuccessPage } from './components/SuccessPage';
 import { HseDashboard } from './components/HseDashboard';
 
+export interface LiveNotification {
+  id: string;
+  type: 'TAMU_DRAFT' | 'TAMU_BARU' | 'TAMU_SELESAI' | 'TAMU_CHECKOUT' | 'SYSTEM';
+  message: string;
+  timestamp: string;
+}
+
+// Browser native AudioContext synthesizer for real-time notification sound
+const playBeep = (freq = 587.33) => {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.2);
+  } catch (e) {
+    // blocked or not supported, ignore gracefully
+  }
+};
+
 type ViewMode = 'PORTAL' | 'WIZARD' | 'SUCCESS' | 'DASHBOARD';
 
 export default function App() {
@@ -25,6 +52,39 @@ export default function App() {
   
   // Active state for just-completed visitor registration
   const [recentRecord, setRecentRecord] = useState<GuestRecord | null>(null);
+
+  // Real-time toast notification list
+  const [notifications, setNotifications] = useState<LiveNotification[]>([]);
+  const isInitialLoadRef = useRef<boolean>(true);
+
+  const showNotification = (type: LiveNotification['type'], message: string) => {
+    const id = Math.random().toString(36).substring(2, 9);
+    const newNotif: LiveNotification = {
+      id,
+      type,
+      message,
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    };
+    
+    setNotifications(prev => [newNotif, ...prev].slice(0, 5));
+    
+    // Play sound based on notification type
+    if (type === 'TAMU_BARU' || type === 'TAMU_SELESAI') {
+      playBeep(659.25); // E5
+      setTimeout(() => playBeep(783.99), 110); // G5
+    } else if (type === 'TAMU_DRAFT') {
+      playBeep(523.25); // C5
+    } else if (type === 'TAMU_CHECKOUT') {
+      playBeep(392.00); // G4
+    } else {
+      playBeep(440.00); // A4
+    }
+
+    // Auto-dismiss after 6 seconds
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    }, 6000);
+  };
 
   // --- WIZARD FORM STATES ---
   const [currentStep, setCurrentStep] = useState<number>(1);
@@ -163,6 +223,14 @@ export default function App() {
     setPicLocation(LOCATIONS[0]);
   }, []);
 
+  // Lift initial loading flag after 3 seconds
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      isInitialLoadRef.current = false;
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, []);
+
   // Real-time automatic background polling (every 3 seconds)
   useEffect(() => {
     const interval = setInterval(() => {
@@ -172,6 +240,38 @@ export default function App() {
         .then(data => {
           if (Array.isArray(data)) {
             setRecords(prev => {
+              // Analyze differences to trigger live desktop alerts across devices!
+              if (!isInitialLoadRef.current) {
+                data.forEach(newRec => {
+                  // Skip if it is our own active session draft
+                  if (activeRegId === newRec.id) return;
+
+                  const oldRec = prev.find(r => r.id === newRec.id);
+                  if (!oldRec) {
+                    const isDraft = newRec.quizResult === 'DRAFT' || !newRec.signature;
+                    if (isDraft) {
+                      showNotification('TAMU_DRAFT', `Tamu sedang mengisi form (Draft): ${newRec.fullName || 'Tamu Baru'} dari ${newRec.company || 'Tanpa Instansi'}`);
+                    } else {
+                      showNotification('TAMU_BARU', `Tamu baru masuk & terdaftar: ${newRec.fullName} dari ${newRec.company}`);
+                    }
+                  } else {
+                    // Check if they transitioned from draft to completed registration
+                    const wasDraft = oldRec.quizResult === 'DRAFT' || !oldRec.signature;
+                    const isNowComplete = newRec.quizResult === 'LULUS' && newRec.signature;
+                    if (wasDraft && isNowComplete) {
+                      showNotification('TAMU_SELESAI', `Pendaftaran Selesai & Lulus K3: ${newRec.fullName} dari ${newRec.company}`);
+                    }
+                    // Check if they checked out
+                    if (!oldRec.exitTime && newRec.exitTime) {
+                      showNotification('TAMU_CHECKOUT', `Tamu telah Checkout (Keluar): ${newRec.fullName} dari ${newRec.company}`);
+                    }
+                  }
+                });
+              }
+
+              // Always write the latest synchronized data to localstorage so it is physically saved in this laptop/device
+              localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(data));
+
               // If we are currently editing a draft, preserve our local edits to avoid cursor jumping
               if (viewMode === 'WIZARD' && activeRegId) {
                 const myLocalDraft = prev.find(r => r.id === activeRegId);
@@ -190,7 +290,11 @@ export default function App() {
         .then(res => res.json())
         .then(data => {
           if (Array.isArray(data)) {
-            setSecurityLogs(data);
+            setSecurityLogs(prev => {
+              // Sync to localstorage so it matches server
+              localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(data));
+              return data;
+            });
           }
         })
         .catch(err => console.warn("Polling logs failed:", err));
@@ -264,7 +368,7 @@ export default function App() {
   // Check if critical APD is filled
   const isPpeComplete = ppeChecklist.safetyHelmet && ppeChecklist.safetyShoes && ppeChecklist.safetyVest;
 
-  // Real-time automatic draft saving of visitor data to the HSE Dashboard
+  // Real-time automatic draft saving of visitor data with 1-second debounce to prevent out-of-order race conditions
   useEffect(() => {
     // Only save draft if we are in the WIZARD and have at least some basic personal info entered
     if (viewMode === 'WIZARD' && (fullName.trim() || company.trim() || phone.trim() || ktpNumber.trim())) {
@@ -307,8 +411,30 @@ export default function App() {
         createdAt: new Date().toISOString()
       };
 
-      // Update locally and trigger single upsert on the server
-      upsertRecordToDb(draftRecord);
+      // 1. Immediately update local state so the current visitor sees no lag
+      setRecords(prev => {
+        const exists = prev.some(r => r.id === currentId);
+        let next: GuestRecord[];
+        if (exists) {
+          next = prev.map(r => r.id === currentId ? draftRecord : r);
+        } else {
+          next = [draftRecord, ...prev];
+        }
+        localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+        return next;
+      });
+
+      // 2. Debounce the network request to the server so we only write the absolute final state when typing pauses
+      const syncTimeout = setTimeout(() => {
+        fetch('/api/records/upsert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(draftRecord)
+        })
+        .catch(err => console.error("Error upserting draft to server:", err));
+      }, 1000);
+
+      return () => clearTimeout(syncTimeout);
     }
   }, [
     viewMode,
@@ -1411,6 +1537,88 @@ export default function App() {
         )}
 
       </main>
+
+      {/* ================= REAL-TIME FLOATING ALERT NOTIFICATION SYSTEM ================= */}
+      {notifications.length > 0 && (
+        <div className="fixed bottom-6 right-6 z-[9999] max-w-sm w-full space-y-3 no-print">
+          <div className="flex items-center justify-between bg-[#0B1E36] border border-slate-700/60 px-4 py-2 rounded-t-xl text-xs font-mono font-bold tracking-wider text-slate-300 shadow-md">
+            <span className="flex items-center gap-1.5 text-orange-400">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-orange-500"></span>
+              </span>
+              MONITOR REAL-TIME AKTIF
+            </span>
+            <button 
+              onClick={() => setNotifications([])} 
+              className="text-slate-400 hover:text-white text-[10px] transition-colors cursor-pointer"
+            >
+              BERSIHKAN ALL
+            </button>
+          </div>
+          <div className="space-y-2 bg-[#081525]/95 border-x border-b border-slate-800 rounded-b-xl p-3 shadow-2xl max-h-[350px] overflow-y-auto">
+            {notifications.map((notif) => {
+              // Custom styles & icons based on type
+              let IconComp = Bell;
+              let iconColor = 'text-blue-400';
+              let bgColor = 'bg-blue-950/45 border-blue-500/20';
+              let badgeText = 'SYSTEM';
+
+              if (notif.type === 'TAMU_DRAFT') {
+                IconComp = ClipboardCheck;
+                iconColor = 'text-amber-400';
+                bgColor = 'bg-amber-950/40 border-amber-500/20';
+                badgeText = 'SEDANG MENGISI';
+              } else if (notif.type === 'TAMU_BARU') {
+                IconComp = UserPlus;
+                iconColor = 'text-emerald-400';
+                bgColor = 'bg-emerald-950/40 border-emerald-500/20';
+                badgeText = 'TAMU MASUK';
+              } else if (notif.type === 'TAMU_SELESAI') {
+                IconComp = Shield;
+                iconColor = 'text-teal-400';
+                bgColor = 'bg-teal-950/40 border-teal-500/20';
+                badgeText = 'LULUS K3';
+              } else if (notif.type === 'TAMU_CHECKOUT') {
+                IconComp = LogOut;
+                iconColor = 'text-rose-400';
+                bgColor = 'bg-rose-950/40 border-rose-500/20';
+                badgeText = 'CHECKOUT';
+              }
+
+              return (
+                <div 
+                  key={notif.id} 
+                  className={`p-3.5 rounded-lg border flex items-start gap-3 transition-all hover:scale-[1.01] ${bgColor}`}
+                >
+                  <div className={`p-2 rounded-lg bg-slate-900 border border-slate-800 mt-0.5 shrink-0 ${iconColor}`}>
+                    <IconComp className="w-4 h-4" />
+                  </div>
+                  <div className="flex-grow min-w-0 text-left">
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <span className="font-mono text-[9px] font-bold bg-slate-900 border border-slate-800 text-slate-400 px-1.5 py-0.5 rounded tracking-wider uppercase">
+                        {badgeText}
+                      </span>
+                      <span className="text-[9px] font-mono text-slate-400">
+                        {notif.timestamp}
+                      </span>
+                    </div>
+                    <p className="text-xs font-semibold leading-normal text-slate-200">
+                      {notif.message}
+                    </p>
+                  </div>
+                  <button 
+                    onClick={() => setNotifications(prev => prev.filter(n => n.id !== notif.id))}
+                    className="text-slate-500 hover:text-slate-200 p-0.5 mt-0.5 transition-colors cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* ================= GLOBAL FOOTER COMPANY TAGS ================= */}
       <footer className="bg-[#07101C] border-t border-slate-900/60 py-4 px-6 text-center text-[10.5px] text-slate-550 select-none font-mono tracking-widest no-print">
