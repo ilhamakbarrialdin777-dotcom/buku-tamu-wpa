@@ -91,8 +91,9 @@ async function startServer() {
   // Real-time EventSource Stream
   app.get("/api/updates/stream", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.flushHeaders();
 
@@ -103,11 +104,20 @@ async function startServer() {
     console.log(`[SSE] Perangkat terhubung: ${clientId}. Total Perangkat Aktif: ${sseClients.length}`);
 
     // Send connection acknowledgement
-    res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", clientId })}\n\n`);
+    try {
+      res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", clientId })}\n\n`);
+    } catch (e) {
+      console.error("[SSE] Gagal mengirim acknowledgement awal:", e);
+    }
 
     // Keep connection alive with heartbeat ping every 15 seconds
     const heartbeat = setInterval(() => {
-      res.write(":\n\n");
+      try {
+        res.write(":\n\n");
+      } catch (err) {
+        console.warn(`[SSE] Gagal mengirim detak jantung (heartbeat) ke klien ${clientId}, menghentikan interval.`);
+        clearInterval(heartbeat);
+      }
     }, 15000);
 
     req.on("close", () => {

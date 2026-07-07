@@ -394,9 +394,14 @@ export default function App() {
       });
 
       eventSource.onerror = (err) => {
-        console.error("[SSE] Terjadi galat pada EventSource stream. Menghubungkan ulang...", err);
-        eventSource?.close();
-        reconnectTimeout = setTimeout(connectSSE, 3000);
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+          console.warn("[SSE] Koneksi terputus total. Mencoba menghubungkan kembali dalam 3 detik...");
+          eventSource.close();
+          reconnectTimeout = setTimeout(connectSSE, 3000);
+        } else {
+          // It's in CONNECTING state, let the browser handle automatic reconnection silently
+          console.log("[SSE] Koneksi terputus sementara. Menghubungkan ulang secara otomatis oleh browser...");
+        }
       };
     };
 
