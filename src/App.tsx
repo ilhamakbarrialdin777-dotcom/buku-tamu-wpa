@@ -79,24 +79,75 @@ export default function App() {
   const [submitProgress, setSubmitProgress] = useState<string>('');
   const [activeRegId, setActiveRegId] = useState<string | null>(null);
 
-  // Auto-seed and load LocalStorage database
+  // Auto-seed and load server/local database with real-time polling
   useEffect(() => {
-    const storedRecords = localStorage.getItem('MINING_GUEST_RECORDS');
-    const storedLogs = localStorage.getItem('MINING_SECURITY_LOGS');
+    // 1. Fetch records from server, fallback to localStorage
+    fetch('/api/records')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setRecords(data);
+          localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(data));
+        } else {
+          const storedRecords = localStorage.getItem('MINING_GUEST_RECORDS');
+          if (storedRecords) {
+            const parsed = JSON.parse(storedRecords);
+            setRecords(parsed);
+            fetch('/api/records', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(parsed)
+            });
+          } else {
+            setRecords(INITIAL_GUEST_RECORDS);
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(INITIAL_GUEST_RECORDS));
+            fetch('/api/records', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(INITIAL_GUEST_RECORDS)
+            });
+          }
+        }
+      })
+      .catch(err => {
+        console.warn("Using local records fallback:", err);
+        const storedRecords = localStorage.getItem('MINING_GUEST_RECORDS');
+        setRecords(storedRecords ? JSON.parse(storedRecords) : INITIAL_GUEST_RECORDS);
+      });
 
-    if (storedRecords) {
-      setRecords(JSON.parse(storedRecords));
-    } else {
-      localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(INITIAL_GUEST_RECORDS));
-      setRecords(INITIAL_GUEST_RECORDS);
-    }
-
-    if (storedLogs) {
-      setSecurityLogs(JSON.parse(storedLogs));
-    } else {
-      localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(INITIAL_SECURITY_LOGS));
-      setSecurityLogs(INITIAL_SECURITY_LOGS);
-    }
+    // 2. Fetch logs from server, fallback to localStorage
+    fetch('/api/logs')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setSecurityLogs(data);
+          localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(data));
+        } else {
+          const storedLogs = localStorage.getItem('MINING_SECURITY_LOGS');
+          if (storedLogs) {
+            const parsed = JSON.parse(storedLogs);
+            setSecurityLogs(parsed);
+            fetch('/api/logs', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(parsed)
+            });
+          } else {
+            setSecurityLogs(INITIAL_SECURITY_LOGS);
+            localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(INITIAL_SECURITY_LOGS));
+            fetch('/api/logs', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(INITIAL_SECURITY_LOGS)
+            });
+          }
+        }
+      })
+      .catch(err => {
+        console.warn("Using local logs fallback:", err);
+        const storedLogs = localStorage.getItem('MINING_SECURITY_LOGS');
+        setSecurityLogs(storedLogs ? JSON.parse(storedLogs) : INITIAL_SECURITY_LOGS);
+      });
 
     // Set today date & standard times
     const now = new Date();
@@ -112,15 +163,61 @@ export default function App() {
     setPicLocation(LOCATIONS[0]);
   }, []);
 
-  // Sync state modifications back to localstorage
+  // Real-time automatic background polling (every 3 seconds)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Fetch latest records
+      fetch('/api/records')
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data)) {
+            setRecords(prev => {
+              // If we are currently editing a draft, preserve our local edits to avoid cursor jumping
+              if (viewMode === 'WIZARD' && activeRegId) {
+                const myLocalDraft = prev.find(r => r.id === activeRegId);
+                if (myLocalDraft) {
+                  return data.map(r => r.id === activeRegId ? myLocalDraft : r);
+                }
+              }
+              return data;
+            });
+          }
+        })
+        .catch(err => console.warn("Polling records failed:", err));
+
+      // Fetch latest logs
+      fetch('/api/logs')
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data)) {
+            setSecurityLogs(data);
+          }
+        })
+        .catch(err => console.warn("Polling logs failed:", err));
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [viewMode, activeRegId]);
+
+  // Sync state modifications back to localstorage and server
   const saveRecordsToDb = (newRecords: GuestRecord[]) => {
     localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(newRecords));
     setRecords(newRecords);
+    fetch('/api/records', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newRecords)
+    }).catch(err => console.error("Error saving records to server:", err));
   };
 
   const saveLogsToDb = (newLogs: SecurityLog[]) => {
     localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(newLogs));
     setSecurityLogs(newLogs);
+    fetch('/api/logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newLogs)
+    }).catch(err => console.error("Error saving logs to server:", err));
   };
 
   // Check if critical APD is filled
@@ -169,7 +266,7 @@ export default function App() {
         createdAt: new Date().toISOString()
       };
 
-      // Upsert draft into records state & localStorage
+      // Upsert draft into records state, localStorage & server
       setRecords(prev => {
         const exists = prev.some(r => r.id === currentId);
         let next: GuestRecord[];
@@ -179,6 +276,14 @@ export default function App() {
           next = [draftRecord, ...prev];
         }
         localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+
+        // Save draft on the server immediately for live dashboard synchronization
+        fetch('/api/records', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(next)
+        }).catch(err => console.error("Error saving draft to server:", err));
+
         return next;
       });
     }
