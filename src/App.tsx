@@ -77,6 +77,7 @@ export default function App() {
   // Form submission / simulation states
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [submitProgress, setSubmitProgress] = useState<string>('');
+  const [activeRegId, setActiveRegId] = useState<string | null>(null);
 
   // Auto-seed and load LocalStorage database
   useEffect(() => {
@@ -124,6 +125,92 @@ export default function App() {
 
   // Check if critical APD is filled
   const isPpeComplete = ppeChecklist.safetyHelmet && ppeChecklist.safetyShoes && ppeChecklist.safetyVest;
+
+  // Real-time automatic draft saving of visitor data to the HSE Dashboard
+  useEffect(() => {
+    // Only save draft if we are in the WIZARD and have at least some basic personal info entered
+    if (viewMode === 'WIZARD' && (fullName.trim() || company.trim() || phone.trim() || ktpNumber.trim())) {
+      let currentId = activeRegId;
+      if (!currentId) {
+        currentId = generateRegistrationId();
+        setActiveRegId(currentId);
+      }
+
+      const draftRecord: GuestRecord = {
+        id: currentId,
+        fullName,
+        company,
+        position,
+        phone,
+        ktpNumber,
+        address,
+        email,
+        gender,
+        visitDate,
+        entryTime,
+        exitTime,
+        photo,
+        visitPurpose,
+        picName,
+        picDepartment,
+        picLocation,
+        activityDescription,
+        ppeChecklist,
+        isPpeComplete,
+        quizAnswers,
+        quizScore,
+        quizResult: quizResult || 'DRAFT', // 'DRAFT' indicates it's currently in progress
+        statementAccepted,
+        signature,
+        signatureName: fullName,
+        signatureDate: new Date().toLocaleDateString('id-ID'),
+        signatureTime: new Date().toLocaleTimeString('id-ID') + ' WITA',
+        gpsLocation: gpsLocation || { latitude: -0.9006, longitude: 119.8707, accuracy: 10, error: "Palu Site Location" }, // PT Watu Perkasa Abadi Palu coordinates
+        createdAt: new Date().toISOString()
+      };
+
+      // Upsert draft into records state & localStorage
+      setRecords(prev => {
+        const exists = prev.some(r => r.id === currentId);
+        let next: GuestRecord[];
+        if (exists) {
+          next = prev.map(r => r.id === currentId ? draftRecord : r);
+        } else {
+          next = [draftRecord, ...prev];
+        }
+        localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+        return next;
+      });
+    }
+  }, [
+    viewMode,
+    fullName,
+    company,
+    position,
+    phone,
+    ktpNumber,
+    address,
+    email,
+    gender,
+    visitDate,
+    entryTime,
+    exitTime,
+    photo,
+    visitPurpose,
+    picName,
+    picDepartment,
+    picLocation,
+    activityDescription,
+    ppeChecklist,
+    isPpeComplete,
+    quizAnswers,
+    quizScore,
+    quizResult,
+    statementAccepted,
+    signature,
+    gpsLocation,
+    activeRegId
+  ]);
 
   // --- COMPONENT HANDLERS ---
   const handlePpeToggle = (key: string) => {
@@ -212,8 +299,8 @@ export default function App() {
     setSubmitProgress("Menyinkronkan notifikasi persetujuan PIC Departemen...");
     await new Promise(r => setTimeout(r, 500));
 
-    // Save Guest Record
-    const regId = generateRegistrationId();
+    // Save Guest Record (reuse draft ID to prevent duplicates)
+    const regId = activeRegId || generateRegistrationId();
     const newRecord: GuestRecord = {
       id: regId,
       fullName,
@@ -243,11 +330,14 @@ export default function App() {
       signatureName: fullName,
       signatureDate: new Date().toLocaleDateString('id-ID'),
       signatureTime: new Date().toLocaleTimeString('id-ID') + ' WITA',
-      gpsLocation: gpsLocation || { latitude: -2.34567, longitude: 115.67891, accuracy: 10, error: "Mocked Site Location" },
+      gpsLocation: gpsLocation || { latitude: -0.9006, longitude: 119.8707, accuracy: 10, error: "Palu Site Location" }, // PT Watu Perkasa Abadi Palu coordinates
       createdAt: new Date().toISOString()
     };
 
-    const updatedRecords = [newRecord, ...records];
+    // Replace the draft record if it exists, otherwise prepend it
+    const updatedRecords = records.some(r => r.id === regId)
+      ? records.map(r => r.id === regId ? newRecord : r)
+      : [newRecord, ...records];
     saveRecordsToDb(updatedRecords);
 
     // Append Security log
@@ -292,6 +382,7 @@ export default function App() {
     setStatementAccepted(false);
     setSignature(null);
     setGpsLocation(null);
+    setActiveRegId(null);
   };
 
   // Dashboard operations

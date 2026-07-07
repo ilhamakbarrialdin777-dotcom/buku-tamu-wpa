@@ -36,7 +36,7 @@ export interface GuestRecord {
   // Quiz
   quizAnswers: Record<number, number>; // questionIndex -> selectedOptionIndex
   quizScore: number;
-  quizResult: 'LULUS' | 'GAGAL';
+  quizResult: 'LULUS' | 'GAGAL' | 'DRAFT' | 'PENGISIAN';
   
   // Pernyataan & Tanda Tangan
   statementAccepted: boolean;

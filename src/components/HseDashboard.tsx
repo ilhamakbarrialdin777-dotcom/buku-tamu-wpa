@@ -370,12 +370,7 @@ export const HseDashboard: React.FC<HseDashboardProps> = ({
                 </button>
               </div>
 
-              <div className="pt-4 border-t border-slate-850 text-[10px] text-slate-500 text-left leading-normal space-y-1 select-none">
-                <span className="font-bold text-[#E85A1B]">KEWENANGAN KUNCI HAK AKSES:</span>
-                <p>&bull; PIN <span className="text-white font-mono">1234</span>: Otoritas Security (Cek-APD, Cetak ID Badge)</p>
-                <p>&bull; PIN <span className="text-white font-mono">5678</span>: Otoritas HSE Superintendent (Log, Stats & Grafis)</p>
-                <p>&bull; PIN <span className="text-white font-mono">9999</span>: Otoritas Administrator (Delete, Backup & Restore)</p>
-              </div>
+
             </form>
 
           </div>
@@ -395,7 +390,7 @@ export const HseDashboard: React.FC<HseDashboardProps> = ({
                   HSE COMMAND DASHBOARD
                 </h1>
                 <span className="text-xs text-slate-400 mt-1 block">
-                  PT. Watu Perkasa Abadi &bull; Area Tambang Kalimantan Selatan
+                  PT. WATU PERKASA ABADI &bull; PALU
                 </span>
               </div>
             </div>

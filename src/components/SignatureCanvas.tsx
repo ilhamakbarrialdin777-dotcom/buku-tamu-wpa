@@ -43,8 +43,8 @@ export const SignatureCanvas: React.FC<SignatureCanvasProps> = ({
     setGpsLoading(true);
     if (!navigator.geolocation) {
       setGpsData({
-        latitude: -2.34567, // Fallback PT. Watu Perkasa Abadi coordinates (South Kalimantan Mine)
-        longitude: 115.67891,
+        latitude: -0.9006, // Fallback PT. Watu Perkasa Abadi coordinates (Palu, Central Sulawesi)
+        longitude: 119.8707,
         accuracy: 8,
         error: "Geolocation API tidak didukung pada browser ini. Menggunakan satelit default."
       });
