@@ -199,11 +199,11 @@ export default function App() {
     return () => clearInterval(interval);
   }, [viewMode, activeRegId]);
 
-  // Sync state modifications back to localstorage and server
+  // Sync state modifications back to localstorage and server (bulk restore)
   const saveRecordsToDb = (newRecords: GuestRecord[]) => {
     localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(newRecords));
     setRecords(newRecords);
-    fetch('/api/records', {
+    fetch('/api/records/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newRecords)
@@ -213,11 +213,52 @@ export default function App() {
   const saveLogsToDb = (newLogs: SecurityLog[]) => {
     localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(newLogs));
     setSecurityLogs(newLogs);
-    fetch('/api/logs', {
+    fetch('/api/logs/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newLogs)
     }).catch(err => console.error("Error saving logs to server:", err));
+  };
+
+  // Smart single record upsert to prevent race conditions when multiple devices are active
+  const upsertRecordToDb = (record: GuestRecord) => {
+    setRecords(prev => {
+      const exists = prev.some(r => r.id === record.id);
+      let next: GuestRecord[];
+      if (exists) {
+        next = prev.map(r => r.id === record.id ? record : r);
+      } else {
+        next = [record, ...prev];
+      }
+      localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+      return next;
+    });
+
+    fetch('/api/records/upsert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(record)
+    }).catch(err => console.error("Error upserting record on server:", err));
+  };
+
+  const upsertLogToDb = (log: SecurityLog) => {
+    setSecurityLogs(prev => {
+      const exists = prev.some(l => l.id === log.id);
+      let next: SecurityLog[];
+      if (exists) {
+        next = prev.map(l => l.id === log.id ? log : l);
+      } else {
+        next = [log, ...prev];
+      }
+      localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(next));
+      return next;
+    });
+
+    fetch('/api/logs/upsert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(log)
+    }).catch(err => console.error("Error upserting log on server:", err));
   };
 
   // Check if critical APD is filled
@@ -266,26 +307,8 @@ export default function App() {
         createdAt: new Date().toISOString()
       };
 
-      // Upsert draft into records state, localStorage & server
-      setRecords(prev => {
-        const exists = prev.some(r => r.id === currentId);
-        let next: GuestRecord[];
-        if (exists) {
-          next = prev.map(r => r.id === currentId ? draftRecord : r);
-        } else {
-          next = [draftRecord, ...prev];
-        }
-        localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
-
-        // Save draft on the server immediately for live dashboard synchronization
-        fetch('/api/records', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(next)
-        }).catch(err => console.error("Error saving draft to server:", err));
-
-        return next;
-      });
+      // Update locally and trigger single upsert on the server
+      upsertRecordToDb(draftRecord);
     }
   }, [
     viewMode,
@@ -439,17 +462,13 @@ export default function App() {
       createdAt: new Date().toISOString()
     };
 
-    // Replace the draft record if it exists, otherwise prepend it
-    const updatedRecords = records.some(r => r.id === regId)
-      ? records.map(r => r.id === regId ? newRecord : r)
-      : [newRecord, ...records];
-    saveRecordsToDb(updatedRecords);
+    // Upsert the single final submitted record to the server
+    upsertRecordToDb(newRecord);
 
     // Append Security log
     const logDesc = `Registrasi Tamu Baru Berhasil: ${newRecord.fullName} dari ${newRecord.company} - PIC: ${newRecord.picName}`;
     const newLog = logSecurityAction("REGISTRATION_SUBMIT", "VISITOR", logDesc);
-    const updatedLogs = [newLog, ...securityLogs];
-    saveLogsToDb(updatedLogs);
+    upsertLogToDb(newLog);
 
     // Save recent state
     setRecentRecord(newRecord);
@@ -490,15 +509,19 @@ export default function App() {
     setActiveRegId(null);
   };
 
-  // Dashboard operations
+  // Dashboard operations with real-time server replication
   const handleDeleteRecord = (id: string) => {
-    const nextList = records.filter(r => r.id !== id);
-    saveRecordsToDb(nextList);
+    setRecords(prev => {
+      const next = prev.filter(r => r.id !== id);
+      localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+      return next;
+    });
+    fetch(`/api/records/${id}`, { method: 'DELETE' })
+      .catch(err => console.error("Error deleting record on server:", err));
   };
 
   const handleUpdateRecord = (updated: GuestRecord) => {
-    const nextList = records.map(r => r.id === updated.id ? updated : r);
-    saveRecordsToDb(nextList);
+    upsertRecordToDb(updated);
     // If the edited record is the one we recently registered, synchronize it to prevent stale state on recent pass page
     if (recentRecord && recentRecord.id === updated.id) {
       setRecentRecord(updated);
@@ -506,7 +529,10 @@ export default function App() {
   };
 
   const handleClearAllDb = () => {
-    saveRecordsToDb([]);
+    setRecords([]);
+    localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify([]));
+    fetch('/api/records/clear', { method: 'POST' })
+      .catch(err => console.error("Error clearing database on server:", err));
   };
 
   const handleRestoreFromBackup = (imported: GuestRecord[]) => {
@@ -516,18 +542,15 @@ export default function App() {
   // Perform manual checkout on live visitors
   const handleCheckoutGuest = (id: string) => {
     const nowTimeStr = new Date().toTimeString().slice(0, 5);
-    const updated = records.map(r => {
-      if (r.id === id) {
-        return { ...r, exitTime: nowTimeStr };
-      }
-      return r;
-    });
-    saveRecordsToDb(updated);
-
     const match = records.find(r => r.id === id);
-    const txt = `Checkout manual berhasil diproses untuk tamu: ${match?.fullName || id}`;
-    const newLog = logSecurityAction("CHECKOUT_FORCE", "SECURITY", txt);
-    saveLogsToDb([newLog, ...securityLogs]);
+    if (match) {
+      const updated = { ...match, exitTime: nowTimeStr };
+      upsertRecordToDb(updated);
+
+      const txt = `Checkout manual berhasil diproses untuk tamu: ${updated.fullName}`;
+      const newLog = logSecurityAction("CHECKOUT_FORCE", "SECURITY", txt);
+      upsertLogToDb(newLog);
+    }
   };
 
   return (
