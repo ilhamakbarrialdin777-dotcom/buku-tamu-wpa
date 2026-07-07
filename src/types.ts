@@ -53,6 +53,9 @@ export interface GuestRecord {
 
   // State metadata
   createdAt: string;
+  updatedAt?: string;
+  version?: number;
+  isPendingSync?: boolean;
 }
 
 export interface SecurityLog {

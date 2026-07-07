@@ -63,6 +63,22 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Active real-time SSE stream clients
+  let sseClients: { id: number; res: any }[] = [];
+
+  // Helper to broadcast event to all clients
+  function broadcast(event: string, data: any) {
+    const payload = JSON.stringify({ type: event, data });
+    sseClients.forEach(client => {
+      try {
+        client.res.write(`event: ${event}\n`);
+        client.res.write(`data: ${payload}\n\n`);
+      } catch (err) {
+        console.error(`Failed to broadcast to client ${client.id}:`, err);
+      }
+    });
+  }
+
   // Middleware to parse JSON
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -70,6 +86,35 @@ async function startServer() {
   // API endpoints
   app.get("/api/records", (req, res) => {
     res.json(readRecords());
+  });
+
+  // Real-time EventSource Stream
+  app.get("/api/updates/stream", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.flushHeaders();
+
+    const clientId = Date.now();
+    const newClient = { id: clientId, res };
+    sseClients.push(newClient);
+
+    console.log(`[SSE] Perangkat terhubung: ${clientId}. Total Perangkat Aktif: ${sseClients.length}`);
+
+    // Send connection acknowledgement
+    res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", clientId })}\n\n`);
+
+    // Keep connection alive with heartbeat ping every 15 seconds
+    const heartbeat = setInterval(() => {
+      res.write(":\n\n");
+    }, 15000);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      sseClients = sseClients.filter(c => c.id !== clientId);
+      console.log(`[SSE] Perangkat terputus: ${clientId}. Total Perangkat Aktif: ${sseClients.length}`);
+    });
   });
 
   // Legacy fallback or bulk save (does merging to be safe)
@@ -82,25 +127,52 @@ async function startServer() {
       records.forEach(r => r && r.id && map.set(r.id, r));
       const merged = Array.from(map.values());
       writeRecords(merged);
+      broadcast("sync_records", merged);
       res.json({ success: true, count: merged.length });
     } else {
       res.status(400).json({ error: "Invalid records format" });
     }
   });
 
-  // Smart Upsert for a single record to prevent race conditions
+  // Smart Upsert with Versioning & Conflict Detection (Last Write Wins based on updatedAt & version)
   app.post("/api/records/upsert", (req, res) => {
     const record = req.body;
     if (record && record.id) {
       const records = readRecords();
       const index = records.findIndex(r => r.id === record.id);
+      let updatedRecord = { ...record };
+      
       if (index !== -1) {
-        records[index] = { ...records[index], ...record };
+        const existing = records[index];
+        const existingVersion = existing.version || 1;
+        const incomingVersion = record.version || 1;
+        
+        const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+        const incomingTime = record.updatedAt ? new Date(record.updatedAt).getTime() : 0;
+        
+        // Conflict check: if server has newer updatedAt, or identical updatedAt with higher version, keep server version
+        if (existingTime > incomingTime || (existingTime === incomingTime && existingVersion > incomingVersion)) {
+          console.warn(`[CONFLICT] Konflik terdeteksi pada ${record.id}: Versi Server (${existingVersion}) lebih baru dari Versi Masuk (${incomingVersion}). Mengabaikan perubahan perangkat.`);
+          return res.json({ success: true, record: existing, conflictResolved: true });
+        }
+        
+        // Incoming is newer, apply and bump version
+        updatedRecord.version = Math.max(existingVersion + 1, incomingVersion);
+        updatedRecord.updatedAt = record.updatedAt || new Date().toISOString();
+        records[index] = { ...existing, ...updatedRecord };
       } else {
-        records.unshift(record);
+        // Brand new record
+        updatedRecord.version = record.version || 1;
+        updatedRecord.updatedAt = record.updatedAt || new Date().toISOString();
+        records.unshift(updatedRecord);
       }
+      
       writeRecords(records);
-      res.json({ success: true, record });
+      
+      // Instantly broadcast the change to all other active devices!
+      broadcast("record_upserted", updatedRecord);
+      
+      res.json({ success: true, record: updatedRecord });
     } else {
       res.status(400).json({ error: "Invalid record format" });
     }
@@ -112,12 +184,17 @@ async function startServer() {
     const records = readRecords();
     const filtered = records.filter(r => r.id !== id);
     writeRecords(filtered);
+    
+    // Instantly notify all connected devices of deletion
+    broadcast("record_deleted", id);
+    
     res.json({ success: true });
   });
 
   // Clear endpoint
   app.post("/api/records/clear", (req, res) => {
     writeRecords([]);
+    broadcast("database_cleared", null);
     res.json({ success: true });
   });
 
@@ -126,6 +203,7 @@ async function startServer() {
     const records = req.body;
     if (Array.isArray(records)) {
       writeRecords(records);
+      broadcast("sync_records", records);
       res.json({ success: true, count: records.length });
     } else {
       res.status(400).json({ error: "Invalid format" });
@@ -146,6 +224,7 @@ async function startServer() {
       logs.forEach(l => l && l.id && map.set(l.id, l));
       const merged = Array.from(map.values());
       writeLogs(merged);
+      broadcast("sync_logs", merged);
       res.json({ success: true, count: merged.length });
     } else {
       res.status(400).json({ error: "Invalid logs format" });
@@ -164,6 +243,7 @@ async function startServer() {
         logs.unshift(log);
       }
       writeLogs(logs);
+      broadcast("log_upserted", log);
       res.json({ success: true, log });
     } else {
       res.status(400).json({ error: "Invalid log format" });
@@ -173,6 +253,7 @@ async function startServer() {
   // Clear logs endpoint
   app.post("/api/logs/clear", (req, res) => {
     writeLogs([]);
+    broadcast("sync_logs", []);
     res.json({ success: true });
   });
 
@@ -181,6 +262,7 @@ async function startServer() {
     const logs = req.body;
     if (Array.isArray(logs)) {
       writeLogs(logs);
+      broadcast("sync_logs", logs);
       res.json({ success: true, count: logs.length });
     } else {
       res.status(400).json({ error: "Invalid format" });

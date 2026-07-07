@@ -49,6 +49,7 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('PORTAL');
   const [records, setRecords] = useState<GuestRecord[]>([]);
   const [securityLogs, setSecurityLogs] = useState<SecurityLog[]>([]);
+  const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
   
   // Active state for just-completed visitor registration
   const [recentRecord, setRecentRecord] = useState<GuestRecord | null>(null);
@@ -211,123 +212,346 @@ export default function App() {
     setPicLocation(LOCATIONS[0]);
   }, []);
 
-  // Real-time automatic background polling (every 1.5 seconds)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      // Fetch latest records
-      fetch('/api/records')
-        .then(res => res.json())
-        .then(data => {
-          if (Array.isArray(data)) {
-            setRecords(prev => {
-              // Analyze differences to trigger live desktop alerts across devices!
-              if (!isInitialLoadRef.current) {
-                data.forEach(newRec => {
-                  // Skip if it is our own active session draft
-                  if (activeRegId === newRec.id) return;
-
-                  const oldRec = prev.find(r => r.id === newRec.id);
-                  if (!oldRec) {
-                    const isDraft = newRec.quizResult === 'DRAFT' || !newRec.signature;
-                    if (isDraft) {
-                      showNotification('TAMU_DRAFT', `Tamu sedang mengisi form (Draft): ${newRec.fullName || 'Tamu Baru'} dari ${newRec.company || 'Tanpa Instansi'}`);
-                    } else {
-                      showNotification('TAMU_BARU', `Tamu baru masuk & terdaftar: ${newRec.fullName} dari ${newRec.company}`);
-                    }
-                  } else {
-                    // Check if they transitioned from draft to completed registration
-                    const wasDraft = oldRec.quizResult === 'DRAFT' || !oldRec.signature;
-                    const isNowComplete = newRec.quizResult === 'LULUS' && newRec.signature;
-                    if (wasDraft && isNowComplete) {
-                      showNotification('TAMU_SELESAI', `Pendaftaran Selesai & Lulus K3: ${newRec.fullName} dari ${newRec.company}`);
-                    }
-                    // Check if they checked out
-                    if (!oldRec.exitTime && newRec.exitTime) {
-                      showNotification('TAMU_CHECKOUT', `Tamu telah Checkout (Keluar): ${newRec.fullName} dari ${newRec.company}`);
-                    }
-                  }
-                });
+  // Helper to fetch full records and logs from server (Single Source of Truth synchronization)
+  const fetchFullSync = () => {
+    console.log("[SYNC] Memulai sinkronisasi penuh dari server...");
+    fetch('/api/records')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setRecords(prev => {
+            // Reconcile and preserve local unsynced offline records if they exist
+            const pending = prev.filter(r => r.isPendingSync);
+            const merged = [...data];
+            pending.forEach(pend => {
+              const idx = merged.findIndex(m => m.id === pend.id);
+              if (idx !== -1) {
+                // If the local pending one is newer, keep it
+                const serverTime = merged[idx].updatedAt ? new Date(merged[idx].updatedAt).getTime() : 0;
+                const localTime = pend.updatedAt ? new Date(pend.updatedAt).getTime() : 0;
+                if (localTime > serverTime) {
+                  merged[idx] = pend;
+                }
+              } else {
+                merged.unshift(pend);
               }
+            });
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(merged));
+            return merged;
+          });
+        }
+      })
+      .catch(err => console.warn("Failed to fetch records during sync:", err));
 
-              // Always write the latest synchronized data to localstorage so it is physically saved in this laptop/device
-              localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(data));
+    fetch('/api/logs')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setSecurityLogs(data);
+          localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(data));
+        }
+      })
+      .catch(err => console.warn("Failed to fetch logs during sync:", err));
+  };
 
-              // If we are currently editing a draft, preserve our local edits to avoid cursor jumping
-              if (viewMode === 'WIZARD' && activeRegId) {
-                const myLocalDraft = prev.find(r => r.id === activeRegId);
-                if (myLocalDraft) {
-                  const draftExistsInServerData = data.some(r => r.id === activeRegId);
-                  if (draftExistsInServerData) {
-                    return data.map(r => r.id === activeRegId ? myLocalDraft : r);
-                  } else {
-                    return [myLocalDraft, ...data];
-                  }
+  // Real-time EventSource connection with fallback reconnection and offline handler
+  useEffect(() => {
+    let eventSource: EventSource | null = null;
+    let reconnectTimeout: any = null;
+
+    const connectSSE = () => {
+      console.log("[SSE] Menghubungkan ke real-time stream...");
+      eventSource = new EventSource("/api/updates/stream");
+
+      eventSource.onopen = () => {
+        console.log("[SSE] Koneksi real-time terjalin.");
+        fetchFullSync();
+      };
+
+      eventSource.addEventListener("record_upserted", (event: any) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const newRec = payload.data;
+          
+          setRecords(prev => {
+            // If we are currently in WIZARD editing this record, do not overwrite to prevent cursor jumps
+            if (viewMode === 'WIZARD' && activeRegId === newRec.id) {
+              return prev;
+            }
+
+            const existing = prev.find(r => r.id === newRec.id);
+            if (existing) {
+              const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+              const incomingTime = newRec.updatedAt ? new Date(newRec.updatedAt).getTime() : 0;
+              const existingVersion = existing.version || 1;
+              const incomingVersion = newRec.version || 1;
+
+              // If our local is newer (like a pending offline write), do not overwrite yet
+              if (existingTime > incomingTime || (existingTime === incomingTime && existingVersion > incomingVersion)) {
+                return prev;
+              }
+            }
+
+            // Real-time toaster alerting for other devices
+            if (!isInitialLoadRef.current) {
+              if (!existing) {
+                const isDraft = newRec.quizResult === 'DRAFT' || !newRec.signature;
+                if (isDraft) {
+                  showNotification('TAMU_DRAFT', `Tamu sedang mengisi form (Draft): ${newRec.fullName || 'Tamu Baru'} dari ${newRec.company || 'Tanpa Instansi'}`);
+                } else {
+                  showNotification('TAMU_BARU', `Tamu baru masuk & terdaftar: ${newRec.fullName} dari ${newRec.company}`);
+                }
+              } else {
+                const wasDraft = existing.quizResult === 'DRAFT' || !existing.signature;
+                const isNowComplete = newRec.quizResult === 'LULUS' && newRec.signature;
+                if (wasDraft && isNowComplete) {
+                  showNotification('TAMU_SELESAI', `Pendaftaran Selesai & Lulus K3: ${newRec.fullName} dari ${newRec.company}`);
+                }
+                if (!existing.exitTime && newRec.exitTime) {
+                  showNotification('TAMU_CHECKOUT', `Tamu telah Checkout (Keluar): ${newRec.fullName} dari ${newRec.company}`);
                 }
               }
-              return data;
-            });
-          }
-        })
-        .catch(err => console.warn("Polling records failed:", err));
+            }
 
-      // Fetch latest logs
-      fetch('/api/logs')
-        .then(res => res.json())
-        .then(data => {
-          if (Array.isArray(data)) {
-            setSecurityLogs(prev => {
-              // Sync to localstorage so it matches server
-              localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(data));
-              return data;
-            });
-          }
-        })
-        .catch(err => console.warn("Polling logs failed:", err));
-    }, 1500);
+            const exists = prev.some(r => r.id === newRec.id);
+            let next: GuestRecord[];
+            if (exists) {
+              next = prev.map(r => r.id === newRec.id ? newRec : r);
+            } else {
+              next = [newRec, ...prev];
+            }
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+            return next;
+          });
+        } catch (e) {
+          console.error("[SSE] Gagal mengolah event record_upserted:", e);
+        }
+      });
 
-    return () => clearInterval(interval);
-  }, [viewMode, activeRegId]);
+      eventSource.addEventListener("record_deleted", (event: any) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const id = payload.data;
+          setRecords(prev => {
+            const next = prev.filter(r => r.id !== id);
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+            return next;
+          });
+        } catch (e) {
+          console.error("[SSE] Gagal mengolah event record_deleted:", e);
+        }
+      });
+
+      eventSource.addEventListener("database_cleared", () => {
+        setRecords([]);
+        localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify([]));
+      });
+
+      eventSource.addEventListener("log_upserted", (event: any) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const newLog = payload.data;
+          setSecurityLogs(prev => {
+            const exists = prev.some(l => l.id === newLog.id);
+            let next: SecurityLog[];
+            if (exists) {
+              next = prev.map(l => l.id === newLog.id ? newLog : l);
+            } else {
+              next = [newLog, ...prev];
+            }
+            localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(next));
+            return next;
+          });
+        } catch (e) {
+          console.error("[SSE] Gagal mengolah event log_upserted:", e);
+        }
+      });
+
+      eventSource.addEventListener("sync_records", (event: any) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const recordsData = payload.data;
+          if (Array.isArray(recordsData)) {
+            setRecords(recordsData);
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(recordsData));
+          }
+        } catch (e) {
+          console.error("[SSE] Gagal mengolah event sync_records:", e);
+        }
+      });
+
+      eventSource.addEventListener("sync_logs", (event: any) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const logsData = payload.data;
+          if (Array.isArray(logsData)) {
+            setSecurityLogs(logsData);
+            localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(logsData));
+          }
+        } catch (e) {
+          console.error("[SSE] Gagal mengolah event sync_logs:", e);
+        }
+      });
+
+      eventSource.onerror = (err) => {
+        console.error("[SSE] Terjadi galat pada EventSource stream. Menghubungkan ulang...", err);
+        eventSource?.close();
+        reconnectTimeout = setTimeout(connectSSE, 3000);
+      };
+    };
+
+    if (isOnline) {
+      connectSSE();
+    }
+
+    return () => {
+      if (eventSource) eventSource.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    };
+  }, [isOnline, viewMode, activeRegId]);
+
+  // Offline pending sync algorithm
+  const syncPendingRecords = () => {
+    const stored = localStorage.getItem('MINING_GUEST_RECORDS');
+    if (!stored) return;
+    try {
+      const parsed: GuestRecord[] = JSON.parse(stored);
+      const pending = parsed.filter(r => r.isPendingSync);
+      if (pending.length === 0) return;
+
+      console.log(`[SYNC] Sinkronisasi ${pending.length} data tertunda (offline) ke server...`);
+      
+      Promise.all(
+        pending.map(record => {
+          const { isPendingSync, ...cleanRecord } = record;
+          return fetch('/api/records/upsert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cleanRecord)
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success && data.record) {
+              setRecords(prev => {
+                const next = prev.map(r => r.id === record.id ? { ...data.record, isPendingSync: false } : r);
+                localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+                return next;
+              });
+
+              // Register successful sync activity
+              const logDesc = `Sinkronisasi Otomatis Sukses (Mode Offline): ${record.fullName} dari ${record.company}`;
+              const newLog = logSecurityAction("OFFLINE_SYNC_SUCCESS", "SYSTEM", logDesc);
+              upsertLogToDb(newLog);
+            }
+          })
+          .catch(err => {
+            console.error(`[SYNC] Gagal mensinkronkan record ${record.id}:`, err);
+          });
+        })
+      ).then(() => {
+        showNotification('SYSTEM', 'Semua data offline berhasil disinkronisasikan ke server.');
+      });
+    } catch (e) {
+      console.error("[SYNC] Gagal mengolah syncPendingRecords:", e);
+    }
+  };
+
+  // Monitor internet connection
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      showNotification('SYSTEM', 'Koneksi internet terdeteksi kembali. Melakukan sinkronisasi data otomatis...');
+      syncPendingRecords();
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      showNotification('SYSTEM', 'Koneksi terputus. Sistem beralih ke Mode Offline secara aman.');
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    if (navigator.onLine) {
+      syncPendingRecords();
+    }
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   // Sync state modifications back to localstorage and server (bulk restore)
   const saveRecordsToDb = (newRecords: GuestRecord[]) => {
     localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(newRecords));
     setRecords(newRecords);
-    fetch('/api/records/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newRecords)
-    }).catch(err => console.error("Error saving records to server:", err));
+    if (isOnline) {
+      fetch('/api/records/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newRecords)
+      }).catch(err => console.error("Error saving records to server:", err));
+    }
   };
 
   const saveLogsToDb = (newLogs: SecurityLog[]) => {
     localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(newLogs));
     setSecurityLogs(newLogs);
-    fetch('/api/logs/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newLogs)
-    }).catch(err => console.error("Error saving logs to server:", err));
+    if (isOnline) {
+      fetch('/api/logs/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newLogs)
+      }).catch(err => console.error("Error saving logs to server:", err));
+    }
   };
 
-  // Smart single record upsert to prevent race conditions when multiple devices are active
+  // Smart single record upsert with offline-awareness
   const upsertRecordToDb = (record: GuestRecord) => {
+    const payload = {
+      ...record,
+      version: record.version || 1,
+      updatedAt: record.updatedAt || new Date().toISOString()
+    };
+
     setRecords(prev => {
-      const exists = prev.some(r => r.id === record.id);
+      const exists = prev.some(r => r.id === payload.id);
       let next: GuestRecord[];
+      const localRecord = { ...payload, isPendingSync: !isOnline };
       if (exists) {
-        next = prev.map(r => r.id === record.id ? record : r);
+        next = prev.map(r => r.id === payload.id ? localRecord : r);
       } else {
-        next = [record, ...prev];
+        next = [localRecord, ...prev];
       }
       localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
       return next;
     });
 
-    fetch('/api/records/upsert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(record)
-    }).catch(err => console.error("Error upserting record on server:", err));
+    if (isOnline) {
+      fetch('/api/records/upsert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.record) {
+          setRecords(prev => prev.map(r => r.id === payload.id ? { ...data.record, isPendingSync: false } : r));
+          localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(
+            records.map(r => r.id === payload.id ? { ...data.record, isPendingSync: false } : r)
+          ));
+        }
+      })
+      .catch(err => {
+        console.warn("[UPSERT] Gagal upsert ke server. Tersimpan offline.");
+        setRecords(prev => {
+          const next = prev.map(r => r.id === payload.id ? { ...r, isPendingSync: true } : r);
+          localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+          return next;
+        });
+      });
+    }
   };
 
   const upsertLogToDb = (log: SecurityLog) => {
@@ -343,11 +567,13 @@ export default function App() {
       return next;
     });
 
-    fetch('/api/logs/upsert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(log)
-    }).catch(err => console.error("Error upserting log on server:", err));
+    if (isOnline) {
+      fetch('/api/logs/upsert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(log)
+      }).catch(err => console.error("Error upserting log on server:", err));
+    }
   };
 
   // Check if critical APD is filled
@@ -362,6 +588,9 @@ export default function App() {
         currentId = generateRegistrationId();
         setActiveRegId(currentId);
       }
+
+      const existingRecord = records.find(r => r.id === currentId);
+      const version = existingRecord?.version || 1;
 
       const draftRecord: GuestRecord = {
         id: currentId,
@@ -393,7 +622,10 @@ export default function App() {
         signatureDate: new Date().toLocaleDateString('id-ID'),
         signatureTime: new Date().toLocaleTimeString('id-ID') + ' WITA',
         gpsLocation: gpsLocation || { latitude: -0.9006, longitude: 119.8707, accuracy: 10, error: "Palu Site Location" }, // PT Watu Perkasa Abadi Palu coordinates
-        createdAt: new Date().toISOString()
+        createdAt: existingRecord?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        version,
+        isPendingSync: !isOnline
       };
 
       // 1. Immediately update local state so the current visitor sees no lag
@@ -411,12 +643,33 @@ export default function App() {
 
       // 2. Debounce the network request to the server so we only write the absolute final state when typing pauses
       const syncTimeout = setTimeout(() => {
+        if (!isOnline) {
+          console.log("[WIZARD DRAFT] Mode Offline: Draf disimpan secara lokal.");
+          return;
+        }
+
         fetch('/api/records/upsert', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(draftRecord)
         })
-        .catch(err => console.error("Error upserting draft to server:", err));
+        .then(res => res.json())
+        .then(data => {
+          if (data.success && data.record) {
+            setRecords(prev => prev.map(r => r.id === currentId ? { ...data.record, isPendingSync: false } : r));
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(
+              records.map(r => r.id === currentId ? { ...data.record, isPendingSync: false } : r)
+            ));
+          }
+        })
+        .catch(err => {
+          console.warn("[WIZARD DRAFT] Gagal upsert draf otomatis ke server. Tersimpan offline.");
+          setRecords(prev => {
+            const next = prev.map(r => r.id === currentId ? { ...r, isPendingSync: true } : r);
+            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(next));
+            return next;
+          });
+        });
       }, 1000);
 
       return () => clearTimeout(syncTimeout);
@@ -673,6 +926,30 @@ export default function App() {
           <button onClick={() => setViewMode('PORTAL')} className="cursor-pointer">
             <MiningLogo light />
           </button>
+
+          {/* Status Koneksi Realtime */}
+          <div className="flex items-center gap-3">
+            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[10.5px] font-mono font-bold uppercase transition-all ${
+              isOnline 
+                ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-400' 
+                : 'bg-rose-950/20 border-rose-500/30 text-rose-400 animate-pulse'
+            }`}>
+              <span className="h-2 w-2 rounded-full relative flex">
+                {isOnline && (
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                )}
+                <span className={`relative inline-flex rounded-full h-2 w-2 ${isOnline ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
+              </span>
+              {isOnline ? 'ONLINE (SINKRON)' : 'OFFLINE MODE'}
+            </div>
+
+            {records.some(r => r.isPendingSync) && (
+              <div className="bg-amber-950/30 border border-amber-500/30 text-amber-400 px-3 py-1.5 rounded-lg text-[10.5px] font-mono font-bold uppercase animate-pulse flex items-center gap-1.5">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                {records.filter(r => r.isPendingSync).length} DATA TERTUNDA
+              </div>
+            )}
+          </div>
 
           {/* Navigation Area */}
           <div className="flex items-center gap-3">
