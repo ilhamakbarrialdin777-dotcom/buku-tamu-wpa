@@ -286,18 +286,38 @@ export default function App() {
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let reconnectTimeout: any = null;
+    let watchdogTimer: any = null;
+
+    const resetWatchdog = () => {
+      if (watchdogTimer) clearTimeout(watchdogTimer);
+      watchdogTimer = setTimeout(() => {
+        console.warn("[SSE] Watchdog Timeout: Tidak menerima aktivitas selama 35 detik. Menutup paksa koneksi mati dan menyambungkan kembali...");
+        if (eventSource) {
+          eventSource.close();
+        }
+        connectSSE();
+      }, 35000);
+    };
 
     const connectSSE = () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       console.log("[SSE] Menghubungkan ke real-time stream...");
       eventSource = new EventSource("/api/updates/stream");
+      resetWatchdog();
 
       eventSource.onopen = () => {
         console.log("[SSE] Koneksi real-time terjalin.");
         fetchFullSync();
+        resetWatchdog();
       };
+
+      eventSource.addEventListener("heartbeat", () => {
+        resetWatchdog();
+      });
 
       eventSource.addEventListener("record_upserted", (event: any) => {
         try {
+          resetWatchdog();
           const payload = JSON.parse(event.data);
           const newRec = payload.data;
           
@@ -358,6 +378,7 @@ export default function App() {
 
       eventSource.addEventListener("record_deleted", (event: any) => {
         try {
+          resetWatchdog();
           const payload = JSON.parse(event.data);
           const id = payload.data;
           setRecords(prev => {
@@ -371,12 +392,14 @@ export default function App() {
       });
 
       eventSource.addEventListener("database_cleared", () => {
+        resetWatchdog();
         setRecords([]);
         localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify([]));
       });
 
       eventSource.addEventListener("log_upserted", (event: any) => {
         try {
+          resetWatchdog();
           const payload = JSON.parse(event.data);
           const newLog = payload.data;
           setSecurityLogs(prev => {
@@ -397,6 +420,7 @@ export default function App() {
 
       eventSource.addEventListener("sync_records", (event: any) => {
         try {
+          resetWatchdog();
           const payload = JSON.parse(event.data);
           const recordsData = payload.data;
           if (Array.isArray(recordsData)) {
@@ -410,6 +434,7 @@ export default function App() {
 
       eventSource.addEventListener("sync_logs", (event: any) => {
         try {
+          resetWatchdog();
           const payload = JSON.parse(event.data);
           const logsData = payload.data;
           if (Array.isArray(logsData)) {
@@ -440,6 +465,7 @@ export default function App() {
     return () => {
       if (eventSource) eventSource.close();
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (watchdogTimer) clearTimeout(watchdogTimer);
     };
   }, [isOnline]);
 
@@ -838,6 +864,9 @@ export default function App() {
 
     // Save Guest Record (reuse draft ID to prevent duplicates)
     const regId = activeRegId || generateRegistrationId();
+    const existingRecord = records.find(r => r.id === regId);
+    const version = (existingRecord?.version || 1) + 1;
+
     const newRecord: GuestRecord = {
       id: regId,
       fullName,
@@ -868,7 +897,9 @@ export default function App() {
       signatureDate: new Date().toLocaleDateString('id-ID'),
       signatureTime: new Date().toLocaleTimeString('id-ID') + ' WITA',
       gpsLocation: gpsLocation || { latitude: -0.9006, longitude: 119.8707, accuracy: 10, error: "Palu Site Location" }, // PT Watu Perkasa Abadi Palu coordinates
-      createdAt: new Date().toISOString()
+      createdAt: existingRecord?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version
     };
 
     // Upsert the single final submitted record to the server
@@ -930,10 +961,15 @@ export default function App() {
   };
 
   const handleUpdateRecord = (updated: GuestRecord) => {
-    upsertRecordToDb(updated);
+    const bumped = {
+      ...updated,
+      version: (updated.version || 1) + 1,
+      updatedAt: new Date().toISOString()
+    };
+    upsertRecordToDb(bumped);
     // If the edited record is the one we recently registered, synchronize it to prevent stale state on recent pass page
     if (recentRecord && recentRecord.id === updated.id) {
-      setRecentRecord(updated);
+      setRecentRecord(bumped);
     }
   };
 
@@ -953,7 +989,12 @@ export default function App() {
     const nowTimeStr = new Date().toTimeString().slice(0, 5);
     const match = records.find(r => r.id === id);
     if (match) {
-      const updated = { ...match, exitTime: nowTimeStr };
+      const updated = { 
+        ...match, 
+        exitTime: nowTimeStr,
+        version: (match.version || 1) + 1,
+        updatedAt: new Date().toISOString()
+      };
       upsertRecordToDb(updated);
 
       const txt = `Checkout manual berhasil diproses untuk tamu: ${updated.fullName}`;

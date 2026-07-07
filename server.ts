@@ -7,56 +7,70 @@ import { INITIAL_GUEST_RECORDS, INITIAL_SECURITY_LOGS } from "./src/utils";
 const RECORDS_FILE = path.join(process.cwd(), "records_db.json");
 const LOGS_FILE = path.join(process.cwd(), "logs_db.json");
 
-// Helper to read records with initial seeding
-function readRecords(): any[] {
+// Thread-safe in-memory cache (Single Source of Truth)
+let cachedRecords: any[] = [];
+let cachedLogs: any[] = [];
+
+// Initialize memory cache from files or seed data
+function initCache() {
   try {
     if (fs.existsSync(RECORDS_FILE)) {
       const data = fs.readFileSync(RECORDS_FILE, "utf-8");
-      return JSON.parse(data);
+      cachedRecords = JSON.parse(data);
     } else {
-      // Seed initial data
-      fs.writeFileSync(RECORDS_FILE, JSON.stringify(INITIAL_GUEST_RECORDS, null, 2), "utf-8");
-      return INITIAL_GUEST_RECORDS;
+      cachedRecords = [...INITIAL_GUEST_RECORDS];
+      fs.writeFileSync(RECORDS_FILE, JSON.stringify(cachedRecords, null, 2), "utf-8");
     }
   } catch (err) {
-    console.error("Error reading records file:", err);
+    console.error("Error initializing records cache:", err);
+    cachedRecords = [...INITIAL_GUEST_RECORDS];
   }
-  return INITIAL_GUEST_RECORDS;
-}
 
-// Helper to write records
-function writeRecords(records: any[]) {
-  try {
-    fs.writeFileSync(RECORDS_FILE, JSON.stringify(records, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Error writing records file:", err);
-  }
-}
-
-// Helper to read logs with initial seeding
-function readLogs(): any[] {
   try {
     if (fs.existsSync(LOGS_FILE)) {
       const data = fs.readFileSync(LOGS_FILE, "utf-8");
-      return JSON.parse(data);
+      cachedLogs = JSON.parse(data);
     } else {
-      // Seed initial data
-      fs.writeFileSync(LOGS_FILE, JSON.stringify(INITIAL_SECURITY_LOGS, null, 2), "utf-8");
-      return INITIAL_SECURITY_LOGS;
+      cachedLogs = [...INITIAL_SECURITY_LOGS];
+      fs.writeFileSync(LOGS_FILE, JSON.stringify(cachedLogs, null, 2), "utf-8");
     }
   } catch (err) {
-    console.error("Error reading logs file:", err);
+    console.error("Error initializing logs cache:", err);
+    cachedLogs = [...INITIAL_SECURITY_LOGS];
   }
-  return INITIAL_SECURITY_LOGS;
 }
 
-// Helper to write logs
+// Call initCache immediately on startup
+initCache();
+
+// Helper to read records (instantly from memory)
+function readRecords(): any[] {
+  return cachedRecords;
+}
+
+// Helper to write records to memory and persist asynchronously
+function writeRecords(records: any[]) {
+  cachedRecords = records;
+  fs.writeFile(RECORDS_FILE, JSON.stringify(records, null, 2), "utf-8", (err) => {
+    if (err) {
+      console.error("Error writing records file asynchronously:", err);
+    }
+  });
+}
+
+// Helper to read logs (instantly from memory)
+function readLogs(): any[] {
+  return cachedLogs;
+}
+
+// Helper to write logs to memory and persist asynchronously
 function writeLogs(logs: any[]) {
-  try {
-    fs.writeFileSync(LOGS_FILE, JSON.stringify(logs, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Error writing logs file:", err);
-  }
+  cachedLogs = logs;
+  fs.writeFile(LOGS_FILE, JSON.stringify(logs, null, 2), "utf-8", (err) => {
+    if (err) {
+      console.error("Error writing logs file asynchronously:", err);
+    }
+  });
 }
 
 async function startServer() {
@@ -66,17 +80,25 @@ async function startServer() {
   // Active real-time SSE stream clients
   let sseClients: { id: number; res: any }[] = [];
 
-  // Helper to broadcast event to all clients
+  // Helper to broadcast event to all clients with automatic dead-client pruning
   function broadcast(event: string, data: any) {
     const payload = JSON.stringify({ type: event, data });
+    let deadClients: number[] = [];
+
     sseClients.forEach(client => {
       try {
         client.res.write(`event: ${event}\n`);
         client.res.write(`data: ${payload}\n\n`);
       } catch (err) {
         console.error(`Failed to broadcast to client ${client.id}:`, err);
+        deadClients.push(client.id);
       }
     });
+
+    if (deadClients.length > 0) {
+      sseClients = sseClients.filter(c => !deadClients.includes(c.id));
+      console.log(`[SSE] Membersihkan ${deadClients.length} perangkat terputus. Sisa Perangkat Aktif: ${sseClients.length}`);
+    }
   }
 
   // Middleware to parse JSON
@@ -88,7 +110,7 @@ async function startServer() {
     res.json(readRecords());
   });
 
-  // Real-time EventSource Stream
+  // Real-time EventSource Stream with active heartbeat and connection recovery
   app.get("/api/updates/stream", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -110,13 +132,14 @@ async function startServer() {
       console.error("[SSE] Gagal mengirim acknowledgement awal:", e);
     }
 
-    // Keep connection alive with heartbeat ping every 15 seconds
+    // Keep connection alive with a physical "heartbeat" event every 15 seconds (detects half-open connections)
     const heartbeat = setInterval(() => {
       try {
-        res.write(":\n\n");
+        res.write(`event: heartbeat\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
       } catch (err) {
-        console.warn(`[SSE] Gagal mengirim detak jantung (heartbeat) ke klien ${clientId}, menghentikan interval.`);
+        console.warn(`[SSE] Gagal mengirim detak jantung ke klien ${clientId}, menghentikan interval.`);
         clearInterval(heartbeat);
+        sseClients = sseClients.filter(c => c.id !== clientId);
       }
     }, 15000);
 
@@ -145,6 +168,7 @@ async function startServer() {
   });
 
   // Smart Upsert with Versioning & Conflict Detection (Last Write Wins based on updatedAt & version)
+  // Rejects conflicts only on final submissions; bypasses checks for active device private drafts
   app.post("/api/records/upsert", (req, res) => {
     const record = req.body;
     if (record && record.id) {
@@ -160,20 +184,26 @@ async function startServer() {
         const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
         const incomingTime = record.updatedAt ? new Date(record.updatedAt).getTime() : 0;
         
-        // Conflict check: if server has newer updatedAt, or identical updatedAt with higher version, keep server version
-        if (existingTime > incomingTime || (existingTime === incomingTime && existingVersion > incomingVersion)) {
-          console.warn(`[CONFLICT] Konflik terdeteksi pada ${record.id}: Versi Server (${existingVersion}) lebih baru dari Versi Masuk (${incomingVersion}). Mengabaikan perubahan perangkat.`);
-          return res.json({ success: true, record: existing, conflictResolved: true });
+        // Draft check: drafts are private to the registering device; do not trigger multi-device conflicts!
+        const isExistingDraft = existing.quizResult === 'DRAFT' || !existing.signature;
+        const isIncomingDraft = record.quizResult === 'DRAFT' || !record.signature;
+
+        if (!isIncomingDraft && !isExistingDraft) {
+          // Conflict check for final submissions: if server has newer updatedAt, or identical updatedAt with higher version
+          if (existingTime > incomingTime || (existingTime === incomingTime && existingVersion > incomingVersion)) {
+            console.warn(`[CONFLICT] Konflik terdeteksi pada ${record.id}: Versi Server (${existingVersion}) lebih baru dari Versi Masuk (${incomingVersion}). Mengabaikan perubahan perangkat.`);
+            return res.json({ success: true, record: existing, conflictResolved: true });
+          }
         }
         
-        // Incoming is newer, apply and bump version
+        // Incoming is newer or it's a draft update, apply and bump version
         updatedRecord.version = Math.max(existingVersion + 1, incomingVersion);
-        updatedRecord.updatedAt = record.updatedAt || new Date().toISOString();
+        updatedRecord.updatedAt = new Date().toISOString(); // Let the server assign the unified monotonic timestamp!
         records[index] = { ...existing, ...updatedRecord };
       } else {
         // Brand new record
         updatedRecord.version = record.version || 1;
-        updatedRecord.updatedAt = record.updatedAt || new Date().toISOString();
+        updatedRecord.updatedAt = new Date().toISOString();
         records.unshift(updatedRecord);
       }
       
