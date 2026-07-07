@@ -141,72 +141,60 @@ export default function App() {
 
   // Auto-seed and load server/local database with real-time polling
   useEffect(() => {
-    // 1. Fetch records from server, fallback to localStorage
+    let recordsLoaded = false;
+    let logsLoaded = false;
+
+    const checkInitialLoadComplete = () => {
+      if (recordsLoaded && logsLoaded) {
+        // Allow a tiny delay for state application before enabling live alert toasts
+        setTimeout(() => {
+          isInitialLoadRef.current = false;
+        }, 300);
+      }
+    };
+
+    // 1. Fetch records from server, fallback to localStorage if offline
     fetch('/api/records')
-      .then(res => res.json())
+      .then(res => {
+        if (!res.ok) throw new Error("Server error");
+        return res.json();
+      })
       .then(data => {
-        if (Array.isArray(data) && data.length > 0) {
+        if (Array.isArray(data)) {
           setRecords(data);
           localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(data));
-        } else {
-          const storedRecords = localStorage.getItem('MINING_GUEST_RECORDS');
-          if (storedRecords) {
-            const parsed = JSON.parse(storedRecords);
-            setRecords(parsed);
-            fetch('/api/records', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(parsed)
-            });
-          } else {
-            setRecords(INITIAL_GUEST_RECORDS);
-            localStorage.setItem('MINING_GUEST_RECORDS', JSON.stringify(INITIAL_GUEST_RECORDS));
-            fetch('/api/records', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(INITIAL_GUEST_RECORDS)
-            });
-          }
         }
+        recordsLoaded = true;
+        checkInitialLoadComplete();
       })
       .catch(err => {
-        console.warn("Using local records fallback:", err);
+        console.warn("Using local records fallback because server is offline:", err);
         const storedRecords = localStorage.getItem('MINING_GUEST_RECORDS');
         setRecords(storedRecords ? JSON.parse(storedRecords) : INITIAL_GUEST_RECORDS);
+        recordsLoaded = true;
+        checkInitialLoadComplete();
       });
 
-    // 2. Fetch logs from server, fallback to localStorage
+    // 2. Fetch logs from server, fallback to localStorage if offline
     fetch('/api/logs')
-      .then(res => res.json())
+      .then(res => {
+        if (!res.ok) throw new Error("Server error");
+        return res.json();
+      })
       .then(data => {
-        if (Array.isArray(data) && data.length > 0) {
+        if (Array.isArray(data)) {
           setSecurityLogs(data);
           localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(data));
-        } else {
-          const storedLogs = localStorage.getItem('MINING_SECURITY_LOGS');
-          if (storedLogs) {
-            const parsed = JSON.parse(storedLogs);
-            setSecurityLogs(parsed);
-            fetch('/api/logs', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(parsed)
-            });
-          } else {
-            setSecurityLogs(INITIAL_SECURITY_LOGS);
-            localStorage.setItem('MINING_SECURITY_LOGS', JSON.stringify(INITIAL_SECURITY_LOGS));
-            fetch('/api/logs', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(INITIAL_SECURITY_LOGS)
-            });
-          }
         }
+        logsLoaded = true;
+        checkInitialLoadComplete();
       })
       .catch(err => {
-        console.warn("Using local logs fallback:", err);
+        console.warn("Using local logs fallback because server is offline:", err);
         const storedLogs = localStorage.getItem('MINING_SECURITY_LOGS');
         setSecurityLogs(storedLogs ? JSON.parse(storedLogs) : INITIAL_SECURITY_LOGS);
+        logsLoaded = true;
+        checkInitialLoadComplete();
       });
 
     // Set today date & standard times
@@ -223,15 +211,7 @@ export default function App() {
     setPicLocation(LOCATIONS[0]);
   }, []);
 
-  // Lift initial loading flag after 3 seconds
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      isInitialLoadRef.current = false;
-    }, 3000);
-    return () => clearTimeout(timer);
-  }, []);
-
-  // Real-time automatic background polling (every 3 seconds)
+  // Real-time automatic background polling (every 1.5 seconds)
   useEffect(() => {
     const interval = setInterval(() => {
       // Fetch latest records
@@ -276,7 +256,12 @@ export default function App() {
               if (viewMode === 'WIZARD' && activeRegId) {
                 const myLocalDraft = prev.find(r => r.id === activeRegId);
                 if (myLocalDraft) {
-                  return data.map(r => r.id === activeRegId ? myLocalDraft : r);
+                  const draftExistsInServerData = data.some(r => r.id === activeRegId);
+                  if (draftExistsInServerData) {
+                    return data.map(r => r.id === activeRegId ? myLocalDraft : r);
+                  } else {
+                    return [myLocalDraft, ...data];
+                  }
                 }
               }
               return data;
@@ -298,7 +283,7 @@ export default function App() {
           }
         })
         .catch(err => console.warn("Polling logs failed:", err));
-    }, 3000);
+    }, 1500);
 
     return () => clearInterval(interval);
   }, [viewMode, activeRegId]);
